@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from typing import (
     Any,
     Awaitable,
@@ -55,6 +56,7 @@ from langgraph.prebuilt.responses import (
     ResponseFormat,
     SchemaSpec,
     ToolOutput,
+    NativeOutput,
 )
 from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.runtime import Runtime
@@ -307,12 +309,17 @@ class _AgentBuilder:
         self._tool_calling_enabled = len(self._tool_classes) > 0
 
     def _setup_structured_output_tools(self) -> None:
-        """Set up structured output tools tracking for the tools strategy.
+        """Set up structured output tracking for "tools" and "native" strategies.
 
-        This method implements the "tools" strategy for structured output by:
+        "tools" strategy for structured output:
         1. Converting response format schemas to LangChain tools
         2. Creating metadata for proper response reconstruction
         3. Handling both Pydantic models and dict schemas
+
+        "native" strategy for structured output: 
+        1. Capturing the schema reference for later parsing
+        2. Binding provider-native response_format kwargs at model bind time
+        3. Parsing provider-enforced structured output directly into the schema
 
         Future strategies (json_mode, guided) will have separate setup methods.
         """
@@ -331,11 +338,13 @@ class _AgentBuilder:
                     self.structured_output_tools[structured_tool_info.tool.name] = (
                         structured_tool_info
                     )
+            elif isinstance(response_format, NativeOutput):
+                self.native_output = response_format
             else:
                 # This shouldn't happen with the new ResponseFormat type, but keeping for safety
                 raise ValueError(
                     f"Unsupported response_format type: {type(response_format)}. "
-                    f"Expected UsingToolStrategy."
+                    f"Expected ToolOutput or NativeOutput."
                 )
 
     def _setup_state_schema(self) -> None:
@@ -410,6 +419,64 @@ class _AgentBuilder:
 
         return None
 
+    def _apply_native_output_binding(
+        self, model: LanguageModelLike
+    ) -> LanguageModelLike:
+        """If native output is configured, bind provider-native kwargs onto the model."""
+        if getattr(self, "native_output", None) is None:
+            return model
+        kwargs = self.native_output.to_model_kwargs()
+        model_with_native_output = model.bind(**kwargs)
+        return model_with_native_output
+
+    def _extract_text_content(
+        self, content: Any
+    ) -> str:
+        if isinstance(content, str):
+            return content
+        # handle content blocks (the way OpenAI returns it)
+        if isinstance(content, list):
+            parts: list[str] = []
+            for c in content:
+                if isinstance(c, dict):
+                    if c.get("type") == "text" and "text" in c:
+                        parts.append(str(c["text"]))
+                    elif "content" in c and isinstance(c["content"], str):
+                        parts.append(c["content"])
+                else:
+                    parts.append(str(c))
+            return "".join(parts)
+        return str(content)
+
+    def _handle_structured_response_native(
+        self, response: AIMessage
+    ) -> Optional[Command]:
+        """If native output is configured and there are no tool calls, parse JSON once."""
+        if getattr(self, "native_output", None) is None:
+            return None
+        if response.tool_calls:
+            # if the model chooses to call tools, we let the normal flow handle it
+            return None
+
+        schema_spec = self.native_output.schema
+        schema_cls = schema_spec.schema
+        try:
+            raw_text = self._extract_text_content(response.content)
+            data = json.loads(raw_text)
+        except Exception as e:
+            raise ValueError(
+                f"Native structured output expected valid JSON for {schema_cls.__name__}, but parsing failed: {e}."
+            ) from e
+
+        try:
+            structured = schema_cls(**data)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to validate native output against {schema_cls.__name__}: {e}"
+            ) from e
+
+        return Command(update={"messages": [response], "structured_response": structured})
+
     def _setup_model(self) -> None:
         """Setup model-related attributes."""
         self._is_dynamic_model = not isinstance(
@@ -455,7 +522,15 @@ class _AgentBuilder:
                         all_tools, tool_choice=tool_choice
                     )
                 else:
-                    model = cast(BaseChatModel, model).bind_tools(all_tools)
+                    # If native output is configured, bind tools with strict=True. Required for OpenAI.
+                    if isinstance(self.response_format, NativeOutput):
+                        model = cast(BaseChatModel, model).bind_tools(all_tools, strict=True)
+                    else:
+                        model = cast(BaseChatModel, model).bind_tools(all_tools)
+
+            # bind native structured-output kwargs
+            model = self._apply_native_output_binding(model)
+
             # Extract just the model part for direct invocation
             self._static_model: Optional[Runnable] = model  # type: ignore[assignment]
         else:
@@ -466,7 +541,8 @@ class _AgentBuilder:
     ) -> LanguageModelLike:
         """Resolve the model to use, handling both static and dynamic models."""
         if self._is_dynamic_model:
-            return self.model(state, runtime)  # type: ignore[operator, arg-type]
+            dynamic = self.model(state, runtime)  # type: ignore[operator, arg-type]
+            return self._apply_native_output_binding(dynamic)
         else:
             return self._static_model
 
@@ -482,7 +558,8 @@ class _AgentBuilder:
             resolved_model = await dynamic_model(state, runtime)
             return resolved_model
         elif self._is_dynamic_model:
-            return self.model(state, runtime)  # type: ignore[arg-type, operator]
+            dynamic = self.model(state, runtime)  # type: ignore[arg-type, operator]
+            return self._apply_native_output_binding(dynamic)
         else:
             return self._static_model
 
@@ -574,7 +651,13 @@ class _AgentBuilder:
             if structured_command:
                 return structured_command
 
+            # Native structured output
+            native_command = self._handle_structured_response_native(response)
+            if native_command:
+                return native_command
+
             return {"messages": [response]}
+
 
         async def acall_model(
             state: StateSchema, runtime: Runtime[ContextT], config: RunnableConfig
@@ -608,6 +691,11 @@ class _AgentBuilder:
             structured_command = self._handle_structured_response_tool_calls(response)
             if structured_command:
                 return structured_command
+
+            # Native structured output
+            native_command = self._handle_structured_response_native(response)
+            if native_command:
+                return native_command
 
             return {"messages": [response]}
 
@@ -912,7 +1000,7 @@ def create_react_agent(
     tools: Union[Sequence[Union[BaseTool, Callable, dict[str, Any]]], ToolNode],
     *,
     prompt: Optional[Prompt] = None,
-    response_format: Optional[Union[ToolOutput, StructuredResponseSchema]] = None,
+    response_format: Optional[Union[ResponseFormat, StructuredResponseSchema]] = None,
     pre_model_hook: Optional[RunnableLike] = None,
     post_model_hook: Optional[RunnableLike] = None,
     state_schema: Optional[StateSchemaType] = None,
@@ -1138,13 +1226,13 @@ def create_react_agent(
             f"Invalid version {version}. Supported versions are 'v1' and 'v2'."
         )
 
-    if response_format and not isinstance(response_format, ToolOutput):
-        # Then it's a pydantic model or JSONSchema. We'll automatically convert
-        # it to the tool output strategy as it is widely supported.
+    if response_format and not isinstance(response_format, (ToolOutput, NativeOutput)):
+        # then it's a bare schema and we default to the tools strategy for widest support
         response_format = ToolOutput(
             schemas=[SchemaSpec(response_format)],
             tool_choice="required",
         )
+
     elif isinstance(response_format, tuple):
         if len(response_format) == 2:
             raise ValueError(
